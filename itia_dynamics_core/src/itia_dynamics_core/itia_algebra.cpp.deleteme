@@ -1,0 +1,593 @@
+#include <itia_dynamics_core/itia_primitives.h>
+
+namespace itia 
+{
+namespace dynamics 
+{
+
+Eigen::Matrix3d skew(const Eigen::Vector3d& vec)
+{
+  Eigen::Matrix3d mat;
+  mat << 0, -vec(2), vec(1),
+    vec(2), 0, -vec(0),
+    -vec(1), vec(0), 0;
+  return mat;
+}
+
+Eigen::Vector3d unskew(const Eigen::Matrix3d& mat)
+{
+  return Eigen::Vector3d(mat(2, 1), mat(0, 2), mat(1, 0));
+}
+
+/*
+ * S_ii=skew(vet_i)
+ * S_jj=R_ji*Sii*R_ij
+ * vet_j=unskew(S_jj)
+ */
+Eigen::Vector3d changeRefFrameSkew(const Eigen::Vector3d& vet_i, Eigen::Matrix3d& R_ji)
+{
+  return Eigen::Vector3d(
+    R_ji(1,2)*(R_ji(2,0)*vet_i(1) - R_ji(2,1)*vet_i(0)) - R_ji(1,1)*(R_ji(2,0)*vet_i(2) - R_ji(2,2)*vet_i(0)) + R_ji(1,0)*(R_ji(2,1)*vet_i(2) - R_ji(2,2)*vet_i(1)), 
+    R_ji(2,2)*(R_ji(0,0)*vet_i(1) - R_ji(0,1)*vet_i(0)) - R_ji(2,1)*(R_ji(0,0)*vet_i(2) - R_ji(0,2)*vet_i(0)) + R_ji(2,0)*(R_ji(0,1)*vet_i(2) - R_ji(0,2)*vet_i(1)), 
+    R_ji(0,2)*(R_ji(1,0)*vet_i(1) - R_ji(1,1)*vet_i(0)) - R_ji(0,1)*(R_ji(1,0)*vet_i(2) - R_ji(1,2)*vet_i(0)) + R_ji(0,0)*(R_ji(1,1)*vet_i(2) - R_ji(1,2)*vet_i(1))
+  );
+}
+
+/*
+ *  W_pp = Rpj*W_jj*T_jp = [S_pp', -S_pp*p_pc+R_pj*vj;0 0]
+ */
+Eigen::Vector6d changeRefFrameJacobian(const Eigen::Vector6d& jac_ii, Eigen::Matrix4d& T_ji)
+{
+  Eigen::Vector6d jac_jj;
+  jac_jj.block(3, 0, 3, 1) = T_ji.block(0, 0, 3, 3) *jac_ii.block(3, 0, 3, 1);
+  jac_jj.block(0, 0, 3, 1) = -((Eigen::Vector3d)jac_jj.block(3, 0, 3, 1)).cross((Eigen::Vector3d)T_ji.block(0, 3, 3, 1)) + T_ji.block(0, 0, 3, 3)*jac_ii.block(0, 0, 3, 1);
+  return jac_jj;
+}
+
+Eigen::Vector6d changeRefFrameJacobian(const Eigen::Vector6d& jac_ii, Eigen::Matrix4d& T_ji, const Eigen::Vector3d& p_je)
+{
+  Eigen::Vector6d jac_jj;
+  jac_jj.block(3, 0, 3, 1) = T_ji.block(0, 0, 3, 3) *jac_ii.block(3, 0, 3, 1);
+  jac_jj.block(0, 0, 3, 1) = ((Eigen::Vector3d)jac_jj.block(3, 0, 3, 1)).cross(p_je-(Eigen::Vector3d)T_ji.block(0, 3, 3, 1)) + T_ji.block(0, 0, 3, 3)*jac_ii.block(0, 0, 3, 1);
+  return jac_jj;
+}
+
+void spatialCrossProduct(const Eigen::Vector6d& vet1, const Eigen::Vector6d& vet2, Eigen::Vector6d* res)
+{
+  res->block(3, 0, 3, 1) = ((Eigen::Vector3d)(vet1.block(3, 0, 3, 1))).cross((Eigen::Vector3d)vet2.block(3, 0, 3, 1));
+  res->block(0, 0, 3, 1) = ((Eigen::Vector3d)(vet1.block(3, 0, 3, 1))).cross((Eigen::Vector3d)vet2.block(0, 0, 3, 1))+
+                           ((Eigen::Vector3d)(vet1.block(0, 0, 3, 1))).cross((Eigen::Vector3d)vet2.block(3, 0, 3, 1));
+}
+
+void spatialDualCrossProduct(const Eigen::Vector6d& vet1, const Eigen::Vector6d& vet2, Eigen::Vector6d* res)
+{
+  res->block(3, 0, 3, 1) = ((Eigen::Vector3d)(vet1.block(3, 0, 3, 1))).cross((Eigen::Vector3d)vet2.block(3, 0, 3, 1))+
+                           ((Eigen::Vector3d)(vet1.block(0, 0, 3, 1))).cross((Eigen::Vector3d)vet2.block(0, 0, 3, 1));
+  res->block(0, 0, 3, 1) = ((Eigen::Vector3d)(vet1.block(3, 0, 3, 1))).cross((Eigen::Vector3d)vet2.block(0, 0, 3, 1));
+
+}
+
+
+
+Joint::Joint()
+{
+  m_last_q = 0;
+  m_last_Dq = 0;
+  m_last_DDq = 0;
+  m_last_DDDq = 0;
+  
+  m_last_T_pc.setIdentity();
+  m_last_R_jc.setIdentity();
+  
+  m_identity.setIdentity();
+  
+  m_last_DT_pc.setZero();
+  m_last_DDT_pc.setZero();
+  m_last_DDDT_pc.setZero();
+  m_Jvec_pc.setZero();
+  m_Jvec_pc_tra.setZero();
+  m_Jvec_pc_tra_c.setZero();
+  m_Jvec_pc_rot.setZero();
+  
+  computedTpc();
+  computedDTpc();
+  computedDDTpc();
+  computedDDDTpc();
+}
+
+/*
+ * Rpc=Rpj*Rjc
+ * DRpc=Rpj*DRjc
+ * S=Rpj*DRjc*Rjc'*Rpj'
+ * S=Rpj*Sjc*Rpj'
+ * 
+ * W_pp = Rpj*W_jj*T_jp = [S_pp', -S_pp*p_pc+R_pj*vj;0 0]
+ * 
+*/
+void Joint::computeJacobian()
+{
+  if (m_type == REVOLUTE)
+  {
+    m_Jvec_pc_rot = m_axis_in_p;
+    m_Jvec_pc_tra =- m_Jvec_pc_rot.cross(m_T_pj.translation());
+    m_Jvec_pc_tra_c.setZero();
+  }
+  else if (m_type == PRISMATIC)
+  {
+    m_Jvec_pc_rot.setZero();
+    m_Jvec_pc_tra =   m_axis_in_p;
+    m_Jvec_pc_tra_c = m_axis_in_p;
+  }
+  m_Jvec_pc <<  m_Jvec_pc_tra, m_Jvec_pc_rot;
+}
+
+
+void Joint::computedTpc()
+{
+  if (m_type == REVOLUTE)
+  {
+    m_last_R_jc = m_identity+sin(m_last_q) *m_skew_axis_in_j+(1-cos(m_last_q)) *m_square_skew_axis_in_j;
+    m_last_T_pc.linear().matrix()= m_R_pj*m_last_R_jc;     //m_T_pj+sin(m_last_q) *m_skew_axis_in_p+(1-cos(m_last_q)) *m_square_skew_axis_in_p;
+  }
+  else if (m_type == PRISMATIC)
+    m_last_T_pc.translation() = m_T_pj.translation()+m_axis_in_p*m_last_q;
+}
+
+/*
+ * ROT
+ * R=I+sin(q)*S(u)+(1-cos(q))*S(u)^2
+ * DR=cos(q)*S(u)+(sin(q))*S(u)^2
+ */
+void Joint::computedDTpc()
+{
+  if (m_type == REVOLUTE)
+  {
+//     m_last_DT_pc.block(0, 0, 3, 3)= m_R_pj*(cos(m_last_q) *m_skew_axis_in_j+sin(m_last_q) *m_square_skew_axis_in_j);
+    m_last_DT_pc.block(0, 0, 3, 3)= (cos(m_last_q) *m_skew_axis_in_p+sin(m_last_q) *m_square_skew_axis_in_p);
+  }
+}
+
+void Joint::computedDDTpc()
+{
+  if (m_type == REVOLUTE)
+    m_last_DDT_pc.block(0, 0, 3, 3)=   (cos(m_last_q)*m_last_DDq - sin(m_last_q)*pow(m_last_Dq, 2.0)) *m_skew_axis_in_p 
+                                    + (sin(m_last_q)*m_last_DDq + cos(m_last_q)*pow(m_last_Dq, 2.0)) *m_square_skew_axis_in_p ;
+  else if (m_type == PRISMATIC)
+    m_last_DT_pc.block(0, 3, 3, 1)= m_axis_in_p*m_last_DDq;
+}
+
+void Joint::computedDDDTpc()
+{
+  if (m_type == REVOLUTE)
+    m_last_DDDT_pc.block(0, 0, 3, 3)=   (cos(m_last_q)*m_last_DDDq - sin(m_last_q) *m_last_Dq*m_last_DDq - sin(m_last_q)*m_last_Dq*m_last_DDq - cos(m_last_q)*pow(m_last_Dq, 3.0) ) *m_skew_axis_in_p 
+                                    + (sin(m_last_q)*m_last_DDq + cos(m_last_q)*pow(m_last_Dq, 2.0)) *m_square_skew_axis_in_p ;
+  else if (m_type == PRISMATIC)
+    m_last_DT_pc.block(0, 3, 3, 1) = m_axis_in_p*m_last_DDDq;
+}
+
+
+void Joint::fromUrdf(const boost::shared_ptr< urdf::Joint >& urdf_joint, const boost::shared_ptr< Link >& parent_link, const boost::shared_ptr< urdf::Link >& child_link)
+{
+  m_parent_link = parent_link;  
+//   urdf_joint->name;
+  m_T_pj = urdfPoseToAffine(urdf_joint->parent_to_joint_origin_transform);
+  m_axis_in_j = urdfVectorToEigen(urdf_joint->axis);
+  m_name = urdf_joint->name;
+  if (m_axis_in_j.norm()>0)
+    m_axis_in_j /= m_axis_in_j.norm();
+  
+  
+  m_skew_axis_in_j = skew(m_axis_in_j);
+  m_square_skew_axis_in_j = m_skew_axis_in_j*m_skew_axis_in_j;
+  m_identity.setIdentity();
+  
+  
+  // Transform in p frame
+  m_R_pj = m_T_pj.linear();
+  m_axis_in_p = m_R_pj*m_axis_in_j;
+  m_skew_axis_in_p = m_T_pj.linear()*m_skew_axis_in_j;
+  m_square_skew_axis_in_p =m_T_pj.linear() *m_square_skew_axis_in_j;
+  m_last_T_pc = m_T_pj;
+  
+  
+  if (urdf_joint->type == urdf::Joint::REVOLUTE)
+    m_type = itia::dynamics::Joint::REVOLUTE;
+  else if (urdf_joint->type == urdf::Joint::CONTINUOUS)
+    m_type = itia::dynamics::Joint::REVOLUTE;
+  else if (urdf_joint->type == urdf::Joint::PRISMATIC)
+  {
+    m_type = itia::dynamics::Joint::PRISMATIC;
+    m_last_DT_pc.block(0, 3, 3, 1) = m_axis_in_p;
+  }
+  else
+    m_type = itia::dynamics::Joint::FIXED;
+  
+  m_child_link.reset(new itia::dynamics::Link() );
+  m_child_link->fromUrdf(child_link, pointer());
+  computedTpc();
+  computedDTpc();
+  computedDDTpc();
+  computedDDDTpc();
+  computeJacobian();
+}
+
+boost::shared_ptr<itia::dynamics::Joint> Joint::pointer()
+{
+  return shared_from_this();
+}
+
+const Eigen::Affine3d& Joint::getTransformation(const double& q)
+{
+  if (q != m_last_q)
+  {
+    m_last_q = q;
+    computedTpc();
+  }
+  return m_last_T_pc;
+}
+
+const Eigen::Vector6d& Joint::getJacobian()
+{
+  return m_Jvec_pc;
+}
+
+const Eigen::Vector3d& Joint::getRotJacobian()
+{
+  return m_Jvec_pc_rot;
+}
+
+const Eigen::Vector3d& Joint::getTraJacobian()
+{
+  return m_Jvec_pc_tra;
+}
+
+const Eigen::Vector3d& Joint::getTraJacobian_in_childorigin()
+{
+  return m_Jvec_pc_tra_c;
+}
+
+
+const Eigen::Matrix4d& Joint::getDTransformation(const double& q)
+{
+  if (q != m_last_q)
+  {
+    m_last_q = q;
+    computedTpc();
+  }
+  return m_last_DT_pc;
+}
+
+const Eigen::Matrix4d& Joint::getDDTransformation(const double& q, const double& Dq, const double& DDq)
+{
+  if (q != m_last_q)
+  {
+    m_last_q = q;
+    computedTpc();
+  }
+  if (Dq != m_last_Dq)
+  {
+    m_last_Dq = Dq;
+    computedDTpc();
+  }
+  if (DDq != m_last_DDq)
+  {
+    m_last_DDq = DDq;
+    computedDDTpc();
+  }
+  return m_last_DDT_pc;
+}
+
+const Eigen::Matrix4d& Joint::getDDDTransformation(const double& q, const double& Dq, const double& DDq, const double& DDDq)
+{
+  if (q != m_last_q)
+  {
+    m_last_q = q;
+    computedTpc();
+  }
+  if (Dq != m_last_Dq)
+  {
+    m_last_Dq = Dq;
+    computedDTpc();
+  }
+  if (DDq != m_last_DDq)
+  {
+    m_last_DDq = DDq;
+    computedDDTpc();
+  }
+  if (DDDq != m_last_DDDq)
+  {
+    m_last_DDDq = DDDq;
+    computedDDDTpc();
+  }
+  return m_last_DDDT_pc;
+}
+
+  
+void Link::fromUrdf(const boost::shared_ptr<urdf::Link>& urdf_link, const boost::shared_ptr<itia::dynamics::Joint>& parent_joint)
+{
+  m_parent_joint = parent_joint;
+  m_name = urdf_link->name;
+  for (int idx = 0; idx<urdf_link->child_joints.size();idx++)
+  {
+    pointer();
+    m_child_joints.push_back( boost::shared_ptr<itia::dynamics::Joint>(new itia::dynamics::Joint()));
+    m_child_joints.back()->fromUrdf(urdf_link->child_joints.at(idx),pointer(), urdf_link->child_links.at(idx));
+    m_child_links.push_back(m_child_joints.at(idx)->getChildLink());
+  }
+}
+boost::shared_ptr<itia::dynamics::Link> Link::pointer()
+{
+  return shared_from_this();
+};
+
+boost::shared_ptr<itia::dynamics::Link> Link::findChild(const std::string& name)
+{
+  boost::shared_ptr<itia::dynamics::Link> ptr;
+  if (m_child_links.size() == 0)
+    return ptr;
+  for (int idx = 0;idx<m_child_links.size();idx++)
+  {
+    if (!m_child_links.at(idx)->getName().compare(name))
+      return m_child_links.at(idx);
+    ptr = m_child_links.at(idx)->findChild(name);
+    if (ptr)
+      return ptr;
+  }
+  return ptr;
+};
+
+boost::shared_ptr< Joint > Link::findChildJoint(const std::string& name)
+{
+  boost::shared_ptr<itia::dynamics::Joint> ptr;
+  if (m_child_joints.size() == 0)
+    return ptr;
+  for (int idx = 0;idx<m_child_joints.size();idx++)
+  {
+    if (!m_child_joints.at(idx)->getName().compare(name))
+      return m_child_joints.at(idx);
+    ptr = m_child_links.at(idx)->findChildJoint(name);
+    if (ptr)
+      return ptr;
+  }
+  return ptr;
+}
+
+
+Chain::Chain(const boost::shared_ptr<itia::dynamics::Link>& root_link, const std::string& base_link_name, const std::string& ee_link_name)
+{
+  m_well_init = false;
+  boost::shared_ptr<itia::dynamics::Link> base_link = root_link->findChild(base_link_name);
+  if (!base_link)
+  {
+    ROS_ERROR("Base link not found");
+    return;
+  }
+  boost::shared_ptr<itia::dynamics::Link> ee_link = base_link->findChild(ee_link_name);
+  if (!ee_link)
+  {
+    ROS_ERROR("Tool link not found");
+    return;
+  }
+  
+  boost::shared_ptr<itia::dynamics::Link> act_link(ee_link);
+  while (1)
+  {
+    m_links.insert(m_links.begin(), act_link);
+    if (act_link->getName().compare(base_link_name))
+    {
+      m_joints.insert(m_joints.begin(), act_link->getParentJoint());
+      act_link = act_link->getParentJoint()->getParentLink();
+    }
+    else
+      break;
+  }
+  
+  for (unsigned int idx = 0;idx<m_links.size();idx++)
+    m_links_name.insert(std::pair<std::string, unsigned int>(m_links.at(idx)->getName(), idx));
+  for (unsigned int idx = 0;idx<m_joints.size();idx++)
+    m_joints_name.insert(std::pair<std::string, unsigned int>(m_joints.at(idx)->getName(), idx));
+  
+  m_joints_number = m_joints.size();
+  m_links_number  = m_links.size();
+  
+  m_input_to_chain_joint.resize(m_joints_number, m_joints_number);
+  m_input_to_chain_joint.setIdentity();
+  
+  m_T_bt.setIdentity();
+  m_last_q.resize(m_joints_number);
+  m_last_q.setZero();
+  
+  m_last_Dq.resize(m_joints_number);
+  m_last_Dq.setZero();
+  m_last_DDq.resize(m_joints_number);
+  m_last_DDq.setZero();
+  m_last_DDDq.resize(m_joints_number);
+  m_last_DDDq.setZero();
+  
+  m_active_joints.resize(m_joints_number);
+  
+  Eigen::Vector6d zero_twist;
+  zero_twist.setZero();
+  for (int idx = 0;idx<m_links_number;idx++)
+  {
+    m_twists.push_back(zero_twist);
+    m_Dtwists_linear_part.push_back(zero_twist);
+    m_Dtwists_nonlinear_part.push_back(zero_twist);
+  }
+  
+  for (int idx = 0;idx<m_joints_number;idx++)
+  {
+    m_T_bt = m_T_bt* m_joints.at(idx)->getTransformation(0).matrix();
+    m_active_joints.at(idx) =idx;
+  }
+  m_sorted_q.resize(m_joints_number);
+  m_sorted_Dq.resize(m_joints_number);
+  m_sorted_DDq.resize(m_joints_number);
+  m_sorted_DDDq.resize(m_joints_number);
+  m_sorted_q.setZero();
+  m_sorted_Dq.setZero();
+  m_sorted_DDq.setZero();
+  m_sorted_DDDq.setZero();
+  
+};
+
+void Chain::setInputJointsName(const std::vector< std::string > joints_name)
+{
+  m_input_to_chain_joint.resize(m_joints_number, joints_name.size());
+  m_input_to_chain_joint.setZero();
+  m_active_joints.resize(joints_name.size());
+  for (int idx = 0;idx<joints_name.size();idx++)
+    if (m_joints_name.find(joints_name.at(idx)) != m_joints_name.end())
+    {
+      m_input_to_chain_joint(m_joints_name.find(joints_name.at(idx))->second, idx) = 1;
+      m_active_joints.at(idx) = m_joints_name.find(joints_name.at(idx))->second;
+    }
+    else
+      ROS_WARN("Joint named '%s' not found", joints_name.at(idx).c_str());
+      
+  m_last_q.resize(joints_name.size());
+  m_last_q.setZero();
+  m_T_bt.setIdentity();
+  
+  m_DT_bt.setZero();
+  m_DDT_bt.setZero();
+  m_DDDT_bt.setZero();
+  
+  m_T_bl.resize(m_joints_number);
+  m_T_bl.at(0) = m_joints.at(0)->getTransformation(0).matrix();
+  for (int idx = 1;idx<m_joints_number;idx++)
+    m_T_bl.at(idx) = m_T_bl.at(idx-1)* m_joints.at(idx)->getTransformation(0).matrix();
+  m_T_bt = m_T_bl.at(m_joints_number-1);
+  
+  m_sorted_q.setZero();
+  m_sorted_Dq.setZero();
+  m_sorted_DDq.setZero();
+  m_sorted_DDDq.setZero();
+  m_DT_bt.setZero();
+  m_DDT_bt.setZero();
+  m_DDDT_bt.setZero();
+  m_jacobian.resize(6, joints_name.size());
+  m_jacobian.setZero();
+  
+  Eigen::Matrix4d eye4;
+  eye4.setIdentity();
+  m_jacobian.col(0) = changeRefFrameJacobian( m_joints.at(0)->getJacobian(),  eye4, m_T_bt.translation());
+  
+
+}
+
+Eigen::Affine3d Chain::getTransformation(const Eigen::VectorXd& q)
+{
+  if ( (q == m_last_q) || (m_joints_number == 0) )
+    return m_T_bt;
+  m_last_q = q;
+  
+  m_sorted_q = m_input_to_chain_joint*q;
+  m_T_bl.at(0) = m_joints.at(0)->getTransformation(m_sorted_q(0));
+  for (int idx = 1;idx<m_joints_number;idx++)
+   m_T_bl.at(idx).matrix() = m_T_bl.at(idx-1).matrix() *  m_joints.at(idx)->getTransformation(m_sorted_q(idx)).matrix();
+  m_T_bt = m_T_bl.at(m_joints_number-1);
+  
+//   m_T_bl.at(0) = m_joints.at(0)->getTransformation(0).matrix();
+//   for (int idx = 1;idx<m_joints_number;idx++)
+//     m_T_bl.at(idx) = m_T_bl.at(idx-1)* m_joints.at(idx)->getTransformation(0).matrix();
+//   
+  return m_T_bt;
+}
+
+
+Eigen::Matrix6Xd Chain::getJacobian(const Eigen::VectorXd& q)
+{
+  getTransformation(q);
+  if (m_joints_number == 0)
+    return m_jacobian;
+
+  m_jacobian.block(0, 0, 3, 1) = ((Eigen::Vector3d)m_jacobian.block(3, m_active_joints.at(0), 3, 1)).cross(m_T_bt.translation()) + m_joints.at(m_active_joints.at(0))->getTraJacobian();
+  for (int idx = 1;idx<m_active_joints.size();idx++)
+  {
+    if (!m_joints.at(m_active_joints.at(idx))->isFixed())
+    {
+      Eigen::Vector3d tmp = m_T_bl.at(idx-1).linear() *m_joints.at(m_active_joints.at(idx))->getRotJacobian();
+      m_jacobian.block(3, idx, 3, 1) = tmp;
+      m_jacobian.block(0, idx, 3, 1) = tmp.cross(m_T_bt.translation()-m_T_bl.at(m_active_joints.at(idx-1)).translation()) + m_T_bl.at(m_active_joints.at(idx-1)).linear() *m_joints.at(m_active_joints.at(idx))->getTraJacobian();
+    }
+  }
+
+//   m_jacobian.block(0, 0, 3, 1) = ((Eigen::Vector3d)m_jacobian.block(3, 0, 3, 1)).cross(m_T_bt.translation()) + m_joints.at(0)->getTraJacobian();
+//   for (int idx = 1;idx<m_joints_number;idx++)
+//   {
+//     if (!m_joints.at(idx)->isFixed())
+//     {
+//       Eigen::Vector3d tmp = m_T_bl.at(idx-1).linear() *m_joints.at(idx)->getRotJacobian();
+//       m_jacobian.block(3, idx, 3, 1) = tmp;
+//       m_jacobian.block(0, idx, 3, 1) = tmp.cross(m_T_bt.translation()-m_T_bl.at(idx-1).translation()) + m_T_bl.at(idx-1).linear() *m_joints.at(idx)->getTraJacobian();
+//     }
+//   }
+    
+  return m_jacobian;
+}
+
+
+std::vector< Eigen::Vector6d,Eigen::aligned_allocator<Eigen::Vector6d> > Chain::getTwist(const Eigen::VectorXd& q, const Eigen::VectorXd& Dq)
+{
+  getTransformation(q);
+  m_sorted_Dq = m_input_to_chain_joint*Dq;
+  for (int nl = 1;nl<m_links_number;nl++)
+  {
+    int nj = nl-1;
+    Eigen::Vector3d wprec = m_twists.at(nl-1).block(3, 0, 3, 1);
+    Eigen::Vector3d displacement;
+    if (nj == 0)
+      displacement = m_T_bl.at(nj).translation();
+    else
+      displacement = m_T_bl.at(nj).translation() - m_T_bl.at(nj-1).translation();
+    
+    // TODO CHECK -- cambio riferimento corretto
+    m_s.at(nl) <<  m_T_bl.at(nj).linear() * m_joints.at(nj)->getTraJacobian_in_childorigin(), m_T_bl.at(nj).linear() * m_joints.at(nj)->getRotJacobian();
+    // TODO ENDCHECK
+    
+    m_twists.at(nl).block(3, 0, 3, 1) = wprec + m_T_bl.at(nj).linear() * m_joints.at(nj)->getRotJacobian() * m_sorted_Dq(nj);
+    m_twists.at(nl).block(0, 0, 3, 1) = m_twists.at(nl-1).block(0, 0, 3, 1) + m_T_bl.at(nj).linear() * m_joints.at(nj)->getTraJacobian_in_childorigin() * m_sorted_Dq(nj)+ wprec.cross(displacement);
+  }
+  return m_twists;
+}
+
+std::vector< Eigen::Vector6d,Eigen::aligned_allocator<Eigen::Vector6d> > Chain::getDTwistLinearPart(const Eigen::VectorXd& q, const Eigen::VectorXd& DDq)
+{
+  getTransformation(q);
+  m_sorted_DDq = m_input_to_chain_joint*DDq;
+  for (int nl = 1;nl<m_links_number;nl++)
+  {
+    int nj = nl-1;
+    Eigen::Vector3d wprec = m_Dtwists_linear_part.at(nl-1).block(3, 0, 3, 1);
+    Eigen::Vector3d displacement;
+    if (nj == 0)
+      displacement = m_T_bl.at(nj).translation();
+    else
+      displacement = m_T_bl.at(nj).translation() - m_T_bl.at(nj-1).translation();
+    m_Dtwists_linear_part.at(nl).block(3, 0, 3, 1) = wprec + m_T_bl.at(nj).linear() * m_joints.at(nj)->getRotJacobian() * m_sorted_DDq(nj);
+    m_Dtwists_linear_part.at(nl).block(0, 0, 3, 1) = m_Dtwists_linear_part.at(nl-1).block(0, 0, 3, 1) + m_T_bl.at(nj).linear() * m_joints.at(nj)->getTraJacobian_in_childorigin() * m_sorted_DDq(nj)+ wprec.cross(displacement);
+  }
+  return m_Dtwists_linear_part;
+};
+
+
+std::vector<Eigen::Vector6d,Eigen::aligned_allocator<Eigen::Vector6d>> Chain::getDTwistNonLinearPart(const Eigen::VectorXd& q, const Eigen::VectorXd& Dq)
+{
+  getTwist(q, Dq);
+  for (int nl = 1;nl<m_links_number;nl++)
+  {
+    int nj = nl-1;
+    Eigen::Vector6d tmp;
+    spatialCrossProduct(m_twists.at(nl) , m_s.at(nl), &tmp);
+    m_Dtwists_nonlinear_part.at(nl) = m_Dtwists_nonlinear_part.at(nl-1)+ tmp * m_sorted_Dq(nj);
+//     
+//     m_Dtwists_nonlinear_part.at(nl).block(0, 0, 3, 1) = m_Dtwists_nonlinear_part.at(nl-1).block(0, 0, 3, 1) + (Eigen::Vector3d)(m_twists.at(nl).block(0, 0, 3, 1)).cross(m_T_bl.at(nj).linear() * m_joints.at(nj)->getTraJacobian_in_childorigin()) * m_sorted_Dq(nj);
+  }
+  
+  return m_Dtwists_nonlinear_part;
+}
+
+
+}
+}
